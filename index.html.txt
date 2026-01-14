@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rocket League Master Edition</title>
+<style>
+body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', sans-serif; }
+#menu {
+position: absolute; width: 100%; height: 100%;
+background: radial-gradient(circle, #1a2a6c, #b21f1f);
+display: flex; flex-direction: column; align-items: center; justify-content: center;
+color: white; z-index: 100;
+}
+.panel { background: rgba(0,0,0,0.8); padding: 40px; border-radius: 20px; border: 2px solid #fff; text-align: center; }
+#game-ui { position: absolute; top: 20px; width: 100%; color: white; display: none; text-align: center; pointer-events: none; }
+#boost-container { position: absolute; bottom: 30px; right: 30px; width: 200px; height: 20px; background: rgba(0,0,0,0.5); border: 2px solid #fff; border-radius: 10px; overflow: hidden; }
+#boost-fill { width: 100%; height: 100%; background: #ffaa00; transition: width 0.1s; }
+#replay-overlay { position: absolute; top: 30%; width: 100%; text-align: center; color: #00ffcc; font-size: 5rem; display: none; font-weight: bold; text-shadow: 4px 4px 10px #000; }
+button { padding: 15px 40px; margin: 10px; font-size: 1.2rem; cursor: pointer; border-radius: 50px; border: none; font-weight: bold; background: #fff; }
+button:hover { background: #00ffcc; transform: scale(1.1); }
+select { padding: 10px; border-radius: 5px; margin: 10px; width: 220px; }
+</style>
+</head>
+<body>
+
+<div id="menu">
+<div class="panel">
+<h1>ROCKET MASTER</h1>
+<label>VEHICLE STYLE:</label><br>
+<select id="carStyle">
+<option value="gt">Mustang GT</option>
+<option value="truck">Heavy Truck</option>
+<option value="classic">Classic Sedan</option>
+</select><br>
+<label>DIFFICULTY:</label><br>
+<select id="botDiff">
+<option value="1.5">Rookie</option>
+<option value="3.5" selected>Pro</option>
+<option value="6.5">All-Star</option>
+</select><br>
+<button onclick="initGame()">KICKOFF</button>
+</div>
+</div>
+
+<div id="game-ui">
+<h1 id="score-board">0 - 0</h1>
+<div id="boost-container"><div id="boost-fill"></div></div>
+</div>
+<div id="replay-overlay">GOAL!</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+
+<script>
+let scene, camera, renderer, world, player, bot, ball, gameActive = false;
+let pScore = 0, bScore = 0, boostAmount = 100, shakeIntensity = 0;
+let nitroParticles = [], worldTexts = [], isFlipping = false, flipProgress = 0, canDodge = true;
+const keys = {};
+
+// Audio Setup
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playSound(freq, type, duration, vol = 0.1) {
+const osc = audioCtx.createOscillator();
+const gain = audioCtx.createGain();
+osc.type = type; osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+osc.connect(gain); gain.connect(audioCtx.destination);
+gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+osc.start(); osc.stop(audioCtx.currentTime + duration);
+}
+
+// --- CAR BUILDER ---
+function buildCarMesh(style, color) {
+const group = new THREE.Group();
+let bodyGeo = (style === 'truck') ? new THREE.BoxGeometry(2.6, 1.8, 5) : new THREE.BoxGeometry(2.4, 1.1, 4.4);
+const mainBody = new THREE.Mesh(bodyGeo, new THREE.MeshStandardMaterial({color: color}));
+group.add(mainBody);
+if(style === 'truck') {
+const cabin = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1, 2), new THREE.MeshStandardMaterial({color: 0x333333}));
+cabin.position.set(0, 1.2, -1); group.add(cabin);
+}
+return group;
+}
+
+// --- GAME INIT ---
+function initGame() {
+document.getElementById('menu').style.display = 'none';
+document.getElementById('game-ui').style.display = 'block';
+
+scene = new THREE.Scene();
+camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+world = new CANNON.World();
+world.gravity.set(0, -18, 0);
+
+// Stadium
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(100, 150), new THREE.MeshStandardMaterial({color: 0x112211}));
+ground.rotation.x = -Math.PI/2; scene.add(ground);
+const gBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane() });
+gBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1,0,0), -Math.PI/2); world.addBody(gBody);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+const sun = new THREE.PointLight(0xffffff, 1, 300); sun.position.set(0, 50, 0); scene.add(sun);
+
+// Ball
+ball = {
+body: new CANNON.Body({ mass: 0.8, shape: new CANNON.Sphere(2), material: new CANNON.Material({restitution: 0.9}) }),
+mesh: new THREE.Mesh(new THREE.SphereGeometry(2, 32, 32), new THREE.MeshStandardMaterial({color: 0xffffff}))
+};
+ball.body.position.set(0, 5, 0); world.addBody(ball.body); scene.add(ball.mesh);
+
+ball.body.addEventListener("collide", (e) => {
+const vel = e.contact.getImpactVelocityAlongNormal();
+if(vel > 15) {
+spawnWorldText("POWER SHOT!", ball.body.position, "#00ffff");
+shakeIntensity = 0.5;
+playSound(100, 'sine', 0.1);
+}
+});
+
+// Player & Bot
+player = { body: new CANNON.Body({ mass: 5, shape: new CANNON.Box(new CANNON.Vec3(1.2, 0.6, 2.2)) }), mesh: buildCarMesh(document.getElementById('carStyle').value, 0x00aaff) };
+bot = { body: new CANNON.Body({ mass: 5, shape: new CANNON.Box(new CANNON.Vec3(1.2, 0.6, 2.2)) }), mesh: buildCarMesh('classic', 0xffaa00) };
+player.body.position.set(0, 2, 45); bot.body.position.set(0, 2, -45);
+world.addBody(player.body); scene.add(player.mesh);
+world.addBody(bot.body); scene.add(bot.mesh);
+
+gameActive = true;
+loop();
+}
+
+// --- SYSTEMS ---
+function spawnNitro() {
+const pGeo = new THREE.SphereGeometry(0.3, 8, 8);
+const pMat = new THREE.MeshBasicMaterial({ color: 0xff8800, transparent: true });
+const pMesh = new THREE.Mesh(pGeo, pMat);
+const offset = new THREE.Vector3(0, -0.5, 2.2).applyQuaternion(player.mesh.quaternion);
+pMesh.position.copy(player.mesh.position).add(offset);
+scene.add(pMesh);
+nitroParticles.push({ mesh: pMesh, life: 1.0 });
+}
+
+function spawnWorldText(text, pos, color) {
+const canvas = document.createElement('canvas'); const ctx = canvas.getContext('2d');
+canvas.width = 256; canvas.height = 128; ctx.font = 'Bold 40px Arial'; ctx.fillStyle = color;
+ctx.textAlign = 'center'; ctx.fillText(text, 128, 64);
+const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true }));
+sprite.position.copy(pos); sprite.position.y += 3; sprite.scale.set(8, 4, 1);
+scene.add(sprite);
+worldTexts.push({ sprite, life: 1.0 });
+}
+
+function triggerGoal(msg) {
+gameActive = false; shakeIntensity = 1.2;
+document.getElementById('replay-overlay').innerText = msg;
+document.getElementById('replay-overlay').style.display = 'block';
+playSound(60, 'sawtooth', 1.0, 0.3);
+setTimeout(() => {
+document.getElementById('replay-overlay').style.display = 'none';
+resetMatch();
+}, 2500);
+}
+
+function resetMatch() {
+ball.body.position.set(0, 10, 0); ball.body.velocity.set(0,0,0);
+player.body.position.set(0, 2, 45); player.body.velocity.set(0,0,0);
+bot.body.position.set(0, 2, -45); bot.body.velocity.set(0,0,0);
+gameActive = true;
+}
+
+window.onkeydown = (e) => keys[e.key.toLowerCase()] = true;
+window.onkeyup = (e) => keys[e.key.toLowerCase()] = false;
+
+// --- LOOP ---
+function loop() {
+requestAnimationFrame(loop);
+if(!gameActive) { renderer.render(scene, camera); return; }
+
+world.step(1/60);
+
+// Driving & Dodge
+const isOnGround = player.body.position.y < 1.3;
+if(isOnGround) canDodge = true;
+
+let fwd = new CANNON.Vec3(0,0,-1); player.body.quaternion.vmult(fwd, fwd);
+let speed = (keys.shift && boostAmount > 0) ? 0.9 : 0.45;
+if(keys.w) player.body.velocity.vadd(fwd.scale(speed), player.body.velocity);
+if(keys.a) player.body.angularVelocity.y = 3.5;
+if(keys.d) player.body.angularVelocity.y = -3.5;
+
+// Boost & Particles
+if(keys.shift && boostAmount > 0 && keys.w) { boostAmount -= 0.6; spawnNitro(); }
+else if(boostAmount < 100) boostAmount += 0.2;
+document.getElementById('boost-fill').style.width = boostAmount + "%";
+
+// Jump / Dash
+if(keys[' ']) {
+if(isOnGround) {
+player.body.applyImpulse(new CANNON.Vec3(0, 25, 0), player.body
